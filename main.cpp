@@ -1,6 +1,7 @@
 #include <vector>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <chrono>
@@ -20,18 +21,42 @@ struct FluidCube {
     float diff;
     float visc;
     int iter = 4;
-    float buoyancy = 0.08f;
-    float dissipation = 0.995f;
+    float buoyancy = 0.03f;
+    float heatBuoyancy = 0.14f;
+    float cooling = 0.97f;
+    float dissipation = 0.985f;
     float vorticity = 0.6f;
-    float exposure = 0.4f;
+    float exposure = 0.8f;
     float maxVel = 0.5f;
+
+    bool useCG = true;
+    int advMode = 1;
+    bool measure = false;
+    float cgTol = 3e-2f;
+    int cgMaxIter = 40;
+    int lastCgIters = 0;
+    float lastCgRelRes = 0.0f;
+    float divRmsBefore = 0.0f;
+    float divRmsAfter = 0.0f;
 
     std::vector<float> s;
     std::vector<float> density;
+    std::vector<float> heat;
+    std::vector<float> heat0;
     std::vector<float> curlX;
     std::vector<float> curlY;
     std::vector<float> curlZ;
     std::vector<float> curlM;
+    std::vector<float> pressA;
+    std::vector<float> pressB;
+    std::vector<float> cgR;
+    std::vector<float> cgZ;
+    std::vector<float> cgD;
+    std::vector<float> cgQ;
+    std::vector<float> macHat;
+    std::vector<float> macBack;
+    std::vector<float> diagP;
+    std::vector<float> invDiagP;
 
     std::vector<float> Vx;
     std::vector<float> Vy;
@@ -45,17 +70,41 @@ struct FluidCube {
         : size(size), dt(dt), diff(diff), visc(visc),
           s(size * size * size, 0.0f),
           density(size * size * size, 0.0f),
+          heat(size * size * size, 0.0f),
+          heat0(size * size * size, 0.0f),
           curlX(size * size * size, 0.0f),
           curlY(size * size * size, 0.0f),
           curlZ(size * size * size, 0.0f),
           curlM(size * size * size, 0.0f),
+          pressA(size * size * size, 0.0f),
+          pressB(size * size * size, 0.0f),
+          cgR(size * size * size, 0.0f),
+          cgZ(size * size * size, 0.0f),
+          cgD(size * size * size, 0.0f),
+          cgQ(size * size * size, 0.0f),
+          macHat(size * size * size, 0.0f),
+          macBack(size * size * size, 0.0f),
           Vx(size * size * size, 0.0f),
           Vy(size * size * size, 0.0f),
           Vz(size * size * size, 0.0f),
           Vx0(size * size * size, 0.0f),
           Vy0(size * size * size, 0.0f),
-          Vz0(size * size * size, 0.0f)
-    {}
+          Vz0(size * size * size, 0.0f),
+          diagP(size * size * size, 0.0f),
+          invDiagP(size * size * size, 0.0f)
+    {
+        for (int z = 1; z < size - 1; z++)
+            for (int y = 1; y < size - 1; y++)
+                for (int x = 1; x < size - 1; x++) {
+                    int dg = 6;
+                    if (x == 1) dg--; if (x == size - 2) dg--;
+                    if (y == 1) dg--;
+                    if (z == 1) dg--; if (z == size - 2) dg--;
+                    int id = IX(x, y, z, size);
+                    diagP[id] = (float)dg;
+                    invDiagP[id] = 1.0f / (float)dg;
+                }
+    }
 
     void addDensity(int x, int y, int z, float amount) {
         int N = size;
@@ -100,6 +149,10 @@ struct FluidCube {
         std::fill(Vx.begin(), Vx.end(), 0.0f);
         std::fill(Vy.begin(), Vy.end(), 0.0f);
         std::fill(Vz.begin(), Vz.end(), 0.0f);
+        std::fill(heat.begin(), heat.end(), 0.0f);
+        std::fill(heat0.begin(), heat0.end(), 0.0f);
+        std::fill(pressA.begin(), pressA.end(), 0.0f);
+        std::fill(pressB.begin(), pressB.end(), 0.0f);
     }
 
     void blendVelocitySphere(float cx, float cy, float cz, float r,
@@ -121,39 +174,92 @@ struct FluidCube {
                 }
     }
 
-    void step() {
+    void raiseDensitySphere(float cx, float cy, float cz, float r, float target) {
         int N = size;
+        int x0 = (int)std::floor(cx - r), x1 = (int)std::ceil(cx + r);
+        int y0 = (int)std::floor(cy - r), y1 = (int)std::ceil(cy + r);
+        int z0 = (int)std::floor(cz - r), z1 = (int)std::ceil(cz + r);
+        for (int z = z0; z <= z1; z++)
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    if (x < 0 || y < 0 || z < 0 || x >= N || y >= N || z >= N) continue;
+                    float dx = x - cx, dy = y - cy, dz = z - cz;
+                    float d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 > r * r) continue;
+                    int id = IX(x, y, z, N);
+                    density[id] = std::max(density[id], target * (1.0f - d2 / (r * r)));
+                }
+    }
+
+    void raiseHeatSphere(float cx, float cy, float cz, float r, float target) {
+        int N = size;
+        int x0 = (int)std::floor(cx - r), x1 = (int)std::ceil(cx + r);
+        int y0 = (int)std::floor(cy - r), y1 = (int)std::ceil(cy + r);
+        int z0 = (int)std::floor(cz - r), z1 = (int)std::ceil(cz + r);
+        for (int z = z0; z <= z1; z++)
+            for (int y = y0; y <= y1; y++)
+                for (int x = x0; x <= x1; x++) {
+                    if (x < 0 || y < 0 || z < 0 || x >= N || y >= N || z >= N) continue;
+                    float dx = x - cx, dy = y - cy, dz = z - cz;
+                    float d2 = dx * dx + dy * dy + dz * dz;
+                    if (d2 > r * r) continue;
+                    int id = IX(x, y, z, N);
+                    heat[id] = std::max(heat[id], target * (1.0f - d2 / (r * r)));
+                }
+    }
+
+    void step() {
+        int N = size, NN = N * N;
+        {
+            float buoy = buoyancy, hbuoy = heatBuoyancy;
+            const float* d = density.data();
+            const float* ht = heat.data();
+            float* vy = Vy.data();
+            #pragma omp parallel for
+            for (int i = 0; i < N * NN; i++) vy[i] += (buoy * d[i] + hbuoy * ht[i]) * dt;
+        }
         vorticityConfinement();
+        {
+            float mv = maxVel;
+            float* vx = Vx.data();
+            float* vy = Vy.data();
+            float* vz = Vz.data();
+            #pragma omp parallel for
+            for (int i = 0; i < N * NN; i++) {
+                vx[i] = std::min(std::max(vx[i], -mv), mv);
+                vy[i] = std::min(std::max(vy[i], -mv), mv);
+                vz[i] = std::min(std::max(vz[i], -mv), mv);
+            }
+        }
         diffuse(1, Vx0.data(), Vx.data(), visc);
         diffuse(2, Vy0.data(), Vy.data(), visc);
         diffuse(3, Vz0.data(), Vz.data(), visc);
 
-        project(Vx0.data(), Vy0.data(), Vz0.data(), Vx.data(), Vy.data());
+        project(Vx0.data(), Vy0.data(), Vz0.data(), pressA.data(), Vy.data());
 
-        advect(1, Vx.data(), Vx0.data(), Vx0.data(), Vy0.data(), Vz0.data());
-        advect(2, Vy.data(), Vy0.data(), Vx0.data(), Vy0.data(), Vz0.data());
-        advect(3, Vz.data(), Vz0.data(), Vx0.data(), Vy0.data(), Vz0.data());
+        bool macV = advMode >= 2;
+        advect(1, Vx.data(), Vx0.data(), Vx0.data(), Vy0.data(), Vz0.data(), macV);
+        advect(2, Vy.data(), Vy0.data(), Vx0.data(), Vy0.data(), Vz0.data(), macV);
+        advect(3, Vz.data(), Vz0.data(), Vx0.data(), Vy0.data(), Vz0.data(), macV);
 
-        project(Vx.data(), Vy.data(), Vz.data(), Vx0.data(), Vy0.data());
+        if (measure) divRmsBefore = divRmsCell();
+        project(Vx.data(), Vy.data(), Vz.data(), pressB.data(), Vx0.data());
+        if (measure) divRmsAfter = divRmsCell();
 
         diffuse(0, s.data(), density.data(), diff);
-        advect(0, density.data(), s.data(), Vx.data(), Vy.data(), Vz.data());
+        advect(0, density.data(), s.data(), Vx.data(), Vy.data(), Vz.data(), advMode >= 1);
+        std::copy(heat.begin(), heat.end(), heat0.begin());
+        advect(0, heat.data(), heat0.data(), Vx.data(), Vy.data(), Vz.data(), false);
 
-        int NN = N * N;
-        float buoy = buoyancy;
-        float diss = dissipation;
-        float mv = maxVel;
-        float* d = density.data();
-        float* vx = Vx.data();
-        float* vy = Vy.data();
-        float* vz = Vz.data();
-        #pragma omp parallel for
-        for (int i = 0; i < N * NN; i++) {
-            vy[i] += buoy * d[i] * dt;
-            d[i] *= diss;
-            vx[i] = std::min(std::max(vx[i], -mv), mv);
-            vy[i] = std::min(std::max(vy[i], -mv), mv);
-            vz[i] = std::min(std::max(vz[i], -mv), mv);
+        {
+            float diss = dissipation, cool = cooling;
+            float* d = density.data();
+            float* ht = heat.data();
+            #pragma omp parallel for
+            for (int i = 0; i < N * NN; i++) {
+                d[i] *= diss;
+                ht[i] = std::max(ht[i] * cool, 0.0f);
+            }
         }
     }
 
@@ -214,7 +320,7 @@ private:
                 x[IX(0, i, j, N)]     = b == 1 ? -x[IX(1, i, j, N)]     : x[IX(1, i, j, N)];
                 x[IX(N - 1, i, j, N)] = b == 1 ? -x[IX(N - 2, i, j, N)] : x[IX(N - 2, i, j, N)];
                 x[IX(i, 0, j, N)]     = b == 2 ? -x[IX(i, 1, j, N)]     : x[IX(i, 1, j, N)];
-                x[IX(i, N - 1, j, N)] = b == 2 ? -x[IX(i, N - 2, j, N)] : x[IX(i, N - 2, j, N)];
+                x[IX(i, N - 1, j, N)] = b == 4 ? 0.0f : x[IX(i, N - 2, j, N)];
                 x[IX(i, j, 0, N)]     = b == 3 ? -x[IX(i, j, 1, N)]     : x[IX(i, j, 1, N)];
                 x[IX(i, j, N - 1, N)] = b == 3 ? -x[IX(i, j, N - 2, N)] : x[IX(i, j, N - 2, N)];
             }
@@ -270,8 +376,150 @@ private:
     }
 
     void diffuse(int b, float* x, const float* x0, float df) {
-        float a = dt * df * (size - 2) * (size - 2);
+        int N = size;
+        if (df <= 0.0f) {
+            std::copy(x0, x0 + N * N * N, x);
+            set_bnd(b, x, N);
+            return;
+        }
+        float a = dt * df * (N - 2) * (N - 2);
         lin_solve(b, x, x0, a, 1 + 6 * a);
+    }
+
+    float divRmsCell() const {
+        int N = size, NN = N * N;
+        double s = 0.0;
+        long cnt = 0;
+        const float* u = Vx.data();
+        const float* v = Vy.data();
+        const float* w = Vz.data();
+        #pragma omp parallel for reduction(+ : s)
+        for (int z = 1; z < N - 1; z++) {
+            int zN = z * NN;
+            for (int y = 1; y < N - 1; y++) {
+                int base = zN + y * N;
+                for (int i = 1; i < N - 1; i++) {
+                    int id = base + i;
+                    float dv = 0.5f * (u[id + 1] - u[id - 1] +
+                                       v[id + N] - v[id - N] +
+                                       w[id + NN] - w[id - NN]);
+                    s += (double)dv * dv;
+                }
+            }
+        }
+        cnt = (long)(N - 2) * (N - 2) * (N - 2);
+        return (float)std::sqrt(s / cnt);
+    }
+
+    void matvecP(const float* p, float* out) {
+        int N = size, NN = N * N;
+        const float* dg = diagP.data();
+        #pragma omp parallel for
+        for (int z = 1; z < N - 1; z++) {
+            int zN = z * NN;
+            for (int y = 1; y < N - 1; y++) {
+                int base = zN + y * N;
+                for (int i = 1; i < N - 1; i++) {
+                    int id = base + i;
+                    float acc = dg[id] * p[id];
+                    if (i > 1)     acc -= p[id - 1];
+                    if (i < N - 2) acc -= p[id + 1];
+                    if (y > 1)     acc -= p[id - N];
+                    if (y < N - 2) acc -= p[id + N];
+                    // y == N-2: top neighbour is Dirichlet p = 0 (counted in diagP, value 0)
+                    if (z > 1)     acc -= p[id - NN];
+                    if (z < N - 2) acc -= p[id + NN];
+                    out[id] = acc;
+                }
+            }
+        }
+    }
+
+    void pcgSolve(float* p, const float* b) {
+        int N = size, NN = N * N;
+        const float* dg = diagP.data();
+        const float* inv = invDiagP.data();
+        float* r = cgR.data();
+        float* z = cgZ.data();
+        float* d = cgD.data();
+        float* q = cgQ.data();
+        lastCgIters = 0;
+        lastCgRelRes = 0.0f;
+        matvecP(p, q);  // masked: p's ghost layer holds set_bnd values
+        double bnorm2 = 0.0, rz = 0.0;
+        #pragma omp parallel for reduction(+ : bnorm2, rz)
+        for (int zz = 1; zz < N - 1; zz++) {
+            int zN = zz * NN;
+            for (int y = 1; y < N - 1; y++) {
+                int base = zN + y * N;
+                for (int i = 1; i < N - 1; i++) {
+                    int id = base + i;
+                    bnorm2 += (double)b[id] * b[id];
+                    float rv = b[id] - q[id];
+                    float zv = rv * inv[id];
+                    r[id] = rv;
+                    z[id] = zv;
+                    d[id] = zv;
+                    rz += (double)rv * zv;
+                }
+            }
+        }
+        if (bnorm2 < 1e-20) return;
+        double rnorm2 = bnorm2;
+
+        for (int k = 0; k < cgMaxIter; k++) {
+            // q = A d (branch-free: cgD ghost layer is permanently 0) fused with dq
+            double dq = 0.0;
+            #pragma omp parallel for reduction(+ : dq)
+            for (int zz = 1; zz < N - 1; zz++) {
+                int zN = zz * NN;
+                for (int y = 1; y < N - 1; y++) {
+                    int base = zN + y * N;
+                    for (int i = 1; i < N - 1; i++) {
+                        int id = base + i;
+                        float qv = dg[id] * d[id] - (d[id - 1] + d[id + 1] +
+                                                    d[id - N] + d[id + N] +
+                                                    d[id - NN] + d[id + NN]);
+                        q[id] = qv;
+                        dq += (double)d[id] * qv;
+                    }
+                }
+            }
+            if (std::fabs(dq) < 1e-30) { lastCgIters = k; break; }
+            float alpha = (float)(rz / dq);
+            // fused: p += a d, r -= a q, z = r * invDiag; accumulate rnorm2 + rzNew
+            rnorm2 = 0.0;
+            double rzNew = 0.0;
+            #pragma omp parallel for reduction(+ : rnorm2, rzNew)
+            for (int zz = 1; zz < N - 1; zz++) {
+                int zN = zz * NN;
+                for (int y = 1; y < N - 1; y++) {
+                    int base = zN + y * N;
+                    for (int i = 1; i < N - 1; i++) {
+                        int id = base + i;
+                        p[id] += alpha * d[id];
+                        float rv = r[id] - alpha * q[id];
+                        float zv = rv * inv[id];
+                        r[id] = rv;
+                        z[id] = zv;
+                        rnorm2 += (double)rv * rv;
+                        rzNew += (double)rv * zv;
+                    }
+                }
+            }
+            lastCgIters = k + 1;
+            lastCgRelRes = (float)std::sqrt(rnorm2 / bnorm2);
+            if (lastCgRelRes < cgTol) break;
+            float beta = (float)(rzNew / rz);
+            rz = rzNew;
+            #pragma omp parallel for
+            for (int zz = 1; zz < N - 1; zz++)
+                for (int y = 1; y < N - 1; y++)
+                    for (int i = 1; i < N - 1; i++) {
+                        int id = zz * NN + y * N + i;
+                        d[id] = z[id] + beta * d[id];
+                    }
+        }
     }
 
     void project(float* u, float* v, float* w, float* p, float* div) {
@@ -287,13 +535,14 @@ private:
                     div[id] = -0.5f * h * (u[id + 1] - u[id - 1] +
                                            v[id + N] - v[id - N] +
                                            w[id + N * N] - w[id - N * N]);
-                    p[id] = 0.0f;
                 }
             }
         }
         set_bnd(0, div, N);
-        set_bnd(0, p, N);
-        lin_solve(0, p, div, 1.0f, 6.0f);
+        set_bnd(4, p, N);
+        if (useCG) pcgSolve(p, div);
+        else lin_solve(4, p, div, 1.0f, 6.0f);
+        set_bnd(4, p, N);
         #pragma omp parallel for
         for (int z = 1; z < N - 1; z++) {
             int zN = z * N * N;
@@ -312,13 +561,14 @@ private:
         set_bnd(3, w, N);
     }
 
-    void advect(int b, float* d, const float* d0,
-                const float* u, const float* v, const float* w) {
+    void semiLag(float* out, const float* in,
+                 const float* u, const float* v, const float* w, float dts) {
         int N = size;
-        float dt0 = dt * (N - 2);
+        float dt0 = dts * (N - 2);
+        int NN = N * N;
         #pragma omp parallel for
         for (int z = 1; z < N - 1; z++) {
-            int zN = z * N * N;
+            int zN = z * NN;
             for (int y = 1; y < N - 1; y++) {
                 int base = zN + y * N;
                 for (int i = 1; i < N - 1; i++) {
@@ -335,12 +585,59 @@ private:
                     float s1 = x - i0, s0 = 1.0f - s1;
                     float t1 = yy - j0, t0 = 1.0f - t1;
                     float u1 = zz - k0, u0 = 1.0f - u1;
-                    int NN = N * N;
-                    d[id] =
-                        u0 * (t0 * (s0 * d0[i0 + j0 * N + k0 * NN] + s1 * d0[i1 + j0 * N + k0 * NN]) +
-                              t1 * (s0 * d0[i0 + j1 * N + k0 * NN] + s1 * d0[i1 + j1 * N + k0 * NN])) +
-                        u1 * (t0 * (s0 * d0[i0 + j0 * N + k1 * NN] + s1 * d0[i1 + j0 * N + k1 * NN]) +
-                              t1 * (s0 * d0[i0 + j1 * N + k1 * NN] + s1 * d0[i1 + j1 * N + k1 * NN]));
+                    out[id] =
+                        u0 * (t0 * (s0 * in[i0 + j0 * N + k0 * NN] + s1 * in[i1 + j0 * N + k0 * NN]) +
+                              t1 * (s0 * in[i0 + j1 * N + k0 * NN] + s1 * in[i1 + j1 * N + k0 * NN])) +
+                        u1 * (t0 * (s0 * in[i0 + j0 * N + k1 * NN] + s1 * in[i1 + j0 * N + k1 * NN]) +
+                              t1 * (s0 * in[i0 + j1 * N + k1 * NN] + s1 * in[i1 + j1 * N + k1 * NN]));
+                }
+            }
+        }
+    }
+
+    void advect(int b, float* d, const float* d0,
+                const float* u, const float* v, const float* w, bool mac) {
+        int N = size;
+        if (!mac) {
+            semiLag(d, d0, u, v, w, dt);
+            set_bnd(b, d, N);
+            return;
+        }
+        float* hat = macHat.data();
+        float* back = macBack.data();
+        semiLag(hat, d0, u, v, w, dt);
+        set_bnd(b, hat, N);
+        semiLag(back, hat, u, v, w, -dt);
+        set_bnd(b, back, N);
+        float dt0 = dt * (N - 2);
+        int NN = N * N;
+        #pragma omp parallel for
+        for (int z = 1; z < N - 1; z++) {
+            int zN = z * NN;
+            for (int y = 1; y < N - 1; y++) {
+                int base = zN + y * N;
+                for (int i = 1; i < N - 1; i++) {
+                    int id = base + i;
+                    float x = i - dt0 * u[id];
+                    float yy = y - dt0 * v[id];
+                    float zz = z - dt0 * w[id];
+                    x = std::min(std::max(x, 0.5f), N - 1.5f);
+                    yy = std::min(std::max(yy, 0.5f), N - 1.5f);
+                    zz = std::min(std::max(zz, 0.5f), N - 1.5f);
+                    int i0 = (int)x, i1 = i0 + 1;
+                    int j0 = (int)yy, j1 = j0 + 1;
+                    int k0 = (int)zz, k1 = k0 + 1;
+                    float mn = d0[i0 + j0 * N + k0 * NN], mx = mn;
+                    const int ci[8] = {i0, i1, i0, i1, i0, i1, i0, i1};
+                    const int cj[8] = {j0, j0, j1, j1, j0, j0, j1, j1};
+                    const int ck[8] = {k0, k0, k0, k0, k1, k1, k1, k1};
+                    for (int c = 1; c < 8; c++) {
+                        float sv = d0[ci[c] + cj[c] * N + ck[c] * NN];
+                        mn = std::min(mn, sv);
+                        mx = std::max(mx, sv);
+                    }
+                    float val = hat[id] + 0.5f * (d0[id] - back[id]);
+                    d[id] = (val < mn || val > mx) ? hat[id] : val;
                 }
             }
         }
@@ -394,8 +691,23 @@ uniform int tilesY;
 uniform int gridN;
 uniform int colorMode;
 uniform float marchSteps;
+uniform vec3 lightDir;
+uniform vec3 lightColor;
+uniform float lightIntensity;
+uniform float ambient;
+uniform int lighting;
+uniform int shadowSteps;
+uniform float shadowSigma;
+uniform float emission;
+uniform float toneExposure;
+uniform int frame;
 
-float sampleDensity(vec3 p) {
+float ign(vec2 px, int f) {
+    return fract(52.9829189 * fract(dot(px + float(f - (f / 64) * 64) * 5.588238,
+                                        vec2(0.06711056, 0.00583715))));
+}
+
+vec2 sampleField(vec3 p) {
     p = clamp(p, 0.0, 0.99999);
     float zf = clamp(p.z * float(gridN) - 0.5, 0.0, float(gridN - 1));
     int z0 = int(floor(zf));
@@ -406,15 +718,21 @@ float sampleDensity(vec3 p) {
     vec2 atlasSize = vec2(float(tilesX) * N, float(tilesY) * N);
     vec2 uv0 = (vec2(float(z0 - (z0 / tilesX) * tilesX), float(z0 / tilesX)) * N + inSlice) / atlasSize;
     vec2 uv1 = (vec2(float(z1 - (z1 / tilesX) * tilesX), float(z1 / tilesX)) * N + inSlice) / atlasSize;
-    float a = texture(atlas, uv0).r;
-    float b = texture(atlas, uv1).r;
+    vec2 a = texture(atlas, uv0).ra;
+    vec2 b = texture(atlas, uv1).ra;
     return mix(a, b, fz);
+}
+
+float sampleDensity(vec3 p) {
+    return sampleField(p).x;
 }
 
 vec3 ramp(float d, float acc) {
     if (colorMode == 0) {
         return mix(vec3(0.55, 0.6, 0.7), vec3(1.0), clamp(d * 1.5, 0.0, 1.0));
     } else if (colorMode == 1) {
+        return mix(vec3(0.10, 0.10, 0.12), vec3(0.32, 0.32, 0.36), d);
+    } else if (colorMode == 3) {
         vec3 c = mix(vec3(0.1, 0.15, 0.5), vec3(1.0, 0.45, 0.05), clamp(d * 2.0, 0.0, 1.0));
         c = mix(c, vec3(1.0, 0.95, 0.8), clamp(d * 2.0 - 1.0, 0.0, 1.0));
         return c * 1.6;
@@ -432,6 +750,20 @@ vec2 boxIntersect(vec3 ro, vec3 rd) {
     return vec2(max(max(tmin.x, tmin.y), tmin.z), min(min(tmax.x, tmax.y), tmax.z));
 }
 
+float hgPhase(float mu, float g) {
+    float g2 = g * g;
+    // normalized so isotropic = 1 (4*pi * HG)
+    return (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * mu, 1.5);
+}
+
+vec3 flameColor(float h) {
+    h = clamp(h, 0.0, 1.0);
+    vec3 c = mix(vec3(0.6, 0.05, 0.0), vec3(1.0, 0.35, 0.02), clamp((h - 0.15) / 0.30, 0.0, 1.0));
+    c = mix(c, vec3(1.0, 0.75, 0.15), clamp((h - 0.45) / 0.30, 0.0, 1.0));
+    c = mix(c, vec3(1.0, 0.9, 0.6), clamp((h - 0.92) / 0.08, 0.0, 1.0));
+    return c;
+}
+
 void main() {
     vec3 rd = normalize(fragPosition - camPos);
     vec2 t = boxIntersect(camPos, rd);
@@ -441,25 +773,53 @@ void main() {
 
     float steps = marchSteps;
     float stepLen = (t1 - t0) / steps;
-    float sigma = 90.0;
+    float sigma = 60.0;
     float T = 1.0;
     vec3 col = vec3(0.0);
     vec3 size = boxMax - boxMin;
+    vec3 L = normalize(lightDir);
+    float jitter = ign(gl_FragCoord.xy, frame);
+    float sjitter = fract(jitter + 0.61803398);
+    float phase = hgPhase(dot(-rd, L), 0.2);
+    bool lit = (lighting != 0);
 
     for (int i = 0; i < 256; i++) {
         if (float(i) >= steps) break;
-        vec3 pos = camPos + rd * (t0 + (float(i) + 0.5) * stepLen);
+        vec3 pos = camPos + rd * (t0 + (float(i) + jitter) * stepLen);
         vec3 uvw = (pos - boxMin) / size;
-        float d = sampleDensity(uvw);
-        if (d > 0.003) {
+        vec2 f = sampleField(uvw);
+        float d = f.x, h = f.y;
+        if (d > 0.003 || h > 0.003) {
             float a = 1.0 - exp(-d * sigma * stepLen);
-            col += T * a * ramp(d, 1.0 - T);
+            vec3 albedo = ramp(d, 1.0 - T);
+            vec3 radiance = albedo;
+            if (lit) {
+                float Tl = 1.0;
+                if (d >= 0.05 && T > 0.05) {
+                    vec2 tl = boxIntersect(pos, L);
+                    float shadowLen = min(tl.y, 0.5);
+                    float sstep = shadowLen / float(shadowSteps);
+                    float depth = 0.0;
+                    for (int j = 0; j < 64; j++) {
+                        if (j >= shadowSteps) break;
+                        vec3 sp = pos + L * ((float(j) + sjitter) * sstep);
+                        depth += sampleDensity((sp - boxMin) / size) * sstep;
+                    }
+                    Tl = exp(-shadowSigma * depth);
+                }
+                radiance = albedo * (ambient + lightColor * Tl * phase * lightIntensity);
+            }
+            col += T * a * radiance;
+            if (colorMode != 0 && h > 0.003) {
+                col += T * flameColor(h) * h * h * emission * stepLen * 40.0;
+            }
             T *= exp(-d * sigma * stepLen);
             if (T < 0.01) break;
         }
     }
     float alpha = 1.0 - T;
     if (alpha < 0.005) discard;
+    col = vec3(1.0) - exp(-col * toneExposure);
     finalColor = vec4(col, alpha);
 }
 )GLSL";
@@ -470,7 +830,7 @@ static Color sliceColor(float d, int mode) {
         unsigned char v = (unsigned char)(d * 255);
         return Color{v, v, v, 255};
     }
-    if (mode == 1) {
+    if (mode == 1 || mode == 3) {
         float t = std::min(d * 2.0f, 1.0f);
         Color a{13, 26, 102, 255}, b{255, 115, 13, 255}, c{255, 242, 204, 255};
         Color lo = {(unsigned char)(a.r + (b.r - a.r) * t), (unsigned char)(a.g + (b.g - a.g) * t),
@@ -483,31 +843,45 @@ static Color sliceColor(float d, int mode) {
                  (unsigned char)(255 - d * 255), 255};
 }
 
+static int soakFrames = 0;
+static bool soakSlice = false, testDrag = false, lumCheck = false;
 int main(int argc, char** argv) {
-    bool shotVolume = false, shotSlice = false;
+    bool shotVolume = false, shotSlice = false, argGS = false, argSL = false, argNoLight = false;
+    int argMode = -1;
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--screenshot") == 0) shotVolume = true;
         if (std::strcmp(argv[i], "--screenshot-slice") == 0) shotSlice = true;
+        if (std::strcmp(argv[i], "--gs") == 0) argGS = true;
+        if (std::strcmp(argv[i], "--sl") == 0) argSL = true;
+        if (std::strcmp(argv[i], "--nolight") == 0) argNoLight = true;
+        if (std::strcmp(argv[i], "--soak") == 0 && i + 1 < argc) soakFrames = std::atoi(argv[++i]);
+        if (std::strcmp(argv[i], "--sliceview") == 0) soakSlice = true;
+        if (std::strcmp(argv[i], "--testdrag") == 0) testDrag = true;
+        if (std::strcmp(argv[i], "--lumcheck") == 0) lumCheck = true;
+        if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) argMode = std::atoi(argv[++i]);
     }
 
     const int N = 48;
-    FluidCube fluid(N, 0.1f, 0.00001f, 0.00001f);
+    FluidCube fluid(N, 0.1f, 0.0f, 0.0f);
+    if (argGS) fluid.useCG = false;
+    if (argSL) fluid.advMode = 0;
+    if (shotVolume || shotSlice) fluid.measure = true;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 720, "3D Fluid - Stable Fluids (raylib)");
-    SetTargetFPS(60);
+    SetTargetFPS((shotVolume || shotSlice || soakFrames) ? 0 : 60);
 
     int tilesX = (int)std::ceil(std::sqrt((double)N));
     int tilesY = (N + tilesX - 1) / tilesX;
     int atlasW = tilesX * N, atlasH = tilesY * N;
-    std::vector<unsigned char> atlasBuf(atlasW * atlasH, 0);
+    std::vector<unsigned char> atlasBuf(atlasW * atlasH * 2, 0);
 
     Image atlasImg;
     atlasImg.data = atlasBuf.data();
     atlasImg.width = atlasW;
     atlasImg.height = atlasH;
     atlasImg.mipmaps = 1;
-    atlasImg.format = PIXELFORMAT_UNCOMPRESSED_GRAYSCALE;
+    atlasImg.format = PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA;
     Texture2D atlasTex = LoadTextureFromImage(atlasImg);
     SetTextureFilter(atlasTex, TEXTURE_FILTER_BILINEAR);
     atlasImg.data = nullptr;
@@ -530,6 +904,16 @@ int main(int argc, char** argv) {
     int locGridN = GetShaderLocation(volShader, "gridN");
     int locColorMode = GetShaderLocation(volShader, "colorMode");
     int locMarch = GetShaderLocation(volShader, "marchSteps");
+    int locLightDir = GetShaderLocation(volShader, "lightDir");
+    int locLightColor = GetShaderLocation(volShader, "lightColor");
+    int locLightIntensity = GetShaderLocation(volShader, "lightIntensity");
+    int locAmbient = GetShaderLocation(volShader, "ambient");
+    int locLighting = GetShaderLocation(volShader, "lighting");
+    int locShadowSteps = GetShaderLocation(volShader, "shadowSteps");
+    int locShadowSigma = GetShaderLocation(volShader, "shadowSigma");
+    int locEmission = GetShaderLocation(volShader, "emission");
+    int locFrame = GetShaderLocation(volShader, "frame");
+    int locToneExposure = GetShaderLocation(volShader, "toneExposure");
 
     Mesh cubeMesh = GenMeshCube(1.0f, 1.0f, 1.0f);
     Model cubeModel = LoadModelFromMesh(cubeMesh);
@@ -544,8 +928,9 @@ int main(int argc, char** argv) {
     cam.projection = CAMERA_PERSPECTIVE;
     float yaw = 0.8f, pitch = 0.35f, dist = 2.6f;
 
-    bool paused = false, emitter = true, sliceView = !shaderOk || shotSlice;
+    bool paused = false, emitter = true, sliceView = !shaderOk || shotSlice || soakSlice;
     int colorMode = 1;
+    if (argMode >= 0 && argMode <= 3) colorMode = argMode;
     bool showHelp = true;
     float stepMs = 0.0f;
     double stepMsAccum = 0.0;
@@ -554,6 +939,10 @@ int main(int argc, char** argv) {
     bool mouseDown = false;
     Vector3 prevHit{};
     float emitAngle = 0.0f;
+    float lightAzim = 0.7f, lightElev = 0.6f;
+    bool lightingOn = !argNoLight;
+    double metMs = 0, metCg = 0, metRes = 0, metBef = 0, metAft = 0, metFrm = 0;
+    int metCount = 0;
 
     auto updateCam = [&]() {
         float cp = std::cos(pitch), sp = std::sin(pitch);
@@ -578,6 +967,19 @@ int main(int argc, char** argv) {
         return Vector3{w.x * N, w.y * N, w.z * N};
     };
 
+    auto injectAt = [&](Vector3 hit, bool hasPrev, Vector3 prev) {
+        Vector3 g = worldToGrid(hit);
+        fluid.raiseDensitySphere(g.x, g.y, g.z, 4.0f, 3.5f);
+        Vector3 drag{0, 0, 0};
+        if (hasPrev) drag = Vector3Subtract(hit, prev);
+        float scale = 30.0f, mv = fluid.maxVel;
+        float ax = std::min(std::max(drag.x * scale, -mv), mv);
+        float ay = std::min(std::max(drag.y * scale, -mv), mv);
+        float az = std::min(std::max(drag.z * scale, -mv), mv);
+        if (Vector3Length(drag) < 1e-4f) ay = 0.15f;
+        fluid.blendVelocitySphere(g.x, g.y, g.z, 5.0f, ax, ay, az, 0.85f);
+    };
+
     while (!WindowShouldClose()) {
         frame++;
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
@@ -592,7 +994,7 @@ int main(int argc, char** argv) {
 
         if (IsKeyPressed(KEY_P)) paused = !paused;
         if (IsKeyPressed(KEY_R)) fluid.reset();
-        if (IsKeyPressed(KEY_C)) colorMode = (colorMode + 1) % 3;
+        if (IsKeyPressed(KEY_C)) colorMode = (colorMode + 1) % 4;
         if (IsKeyPressed(KEY_V)) sliceView = !sliceView;
         if (IsKeyPressed(KEY_SPACE)) emitter = !emitter;
         if (IsKeyPressed(KEY_F1)) showHelp = !showHelp;
@@ -600,39 +1002,54 @@ int main(int argc, char** argv) {
         if (IsKeyPressed(KEY_TWO)) fluid.buoyancy += 0.05f;
         if (IsKeyPressed(KEY_THREE)) fluid.dissipation = std::max(0.9f, fluid.dissipation - 0.002f);
         if (IsKeyPressed(KEY_FOUR)) fluid.dissipation = std::min(1.0f, fluid.dissipation + 0.002f);
-        if (IsKeyPressed(KEY_LEFT_BRACKET)) fluid.iter = std::max(1, fluid.iter - 1);
-        if (IsKeyPressed(KEY_RIGHT_BRACKET)) fluid.iter = std::min(64, fluid.iter + 1);
+        if (IsKeyPressed(KEY_LEFT_BRACKET)) {
+            if (fluid.useCG) fluid.cgMaxIter = std::max(5, fluid.cgMaxIter - 5);
+            else fluid.iter = std::max(1, fluid.iter - 1);
+        }
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) {
+            if (fluid.useCG) fluid.cgMaxIter = std::min(200, fluid.cgMaxIter + 5);
+            else fluid.iter = std::min(64, fluid.iter + 1);
+        }
         if (IsKeyPressed(KEY_FIVE)) fluid.vorticity = std::max(0.0f, fluid.vorticity - 0.1f);
         if (IsKeyPressed(KEY_SIX)) fluid.vorticity = std::min(10.0f, fluid.vorticity + 0.1f);
         if (IsKeyPressed(KEY_SEVEN)) fluid.exposure = std::max(0.01f, fluid.exposure - 0.05f);
         if (IsKeyPressed(KEY_EIGHT)) fluid.exposure = std::min(5.0f, fluid.exposure + 0.05f);
+        if (IsKeyPressed(KEY_M)) fluid.advMode = (fluid.advMode + 1) % 3;
+        if (IsKeyPressed(KEY_G)) fluid.useCG = !fluid.useCG;
+        if (IsKeyPressed(KEY_L)) lightingOn = !lightingOn;
+        if (IsKeyDown(KEY_LEFT)) lightAzim -= 0.02f;
+        if (IsKeyDown(KEY_RIGHT)) lightAzim += 0.02f;
+        if (IsKeyDown(KEY_UP)) lightElev = std::min(1.5f, lightElev + 0.02f);
+        if (IsKeyDown(KEY_DOWN)) lightElev = std::max(0.05f, lightElev - 0.02f);
 
         if (!paused) {
             emitAngle += 0.05f;
             if (emitter) {
                 float cx = N * 0.5f + std::cos(emitAngle) * 2.0f;
                 float cz = N * 0.5f + std::sin(emitAngle) * 2.0f;
-                fluid.addDensitySphere(cx, 5.0f, cz, 2.5f, 5.0f);
-                fluid.blendVelocitySphere(cx, 5.0f, cz, 3.0f,
+                fluid.raiseDensitySphere(cx, 5.0f, cz, 3.5f, 1.5f);
+                fluid.raiseHeatSphere(cx, 5.0f, cz, 3.0f, 1.0f);
+                fluid.raiseHeatSphere(cx, 9.0f, cz, 2.5f, 0.7f);
+                fluid.blendVelocitySphere(cx, 5.0f, cz, 3.5f,
                                           std::cos(emitAngle * 1.7f) * 0.12f,
-                                          0.28f,
+                                          0.4f,
                                           std::sin(emitAngle * 1.7f) * 0.12f, 0.5f);
             }
 
             Vector3 hit;
             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && mouseHitOnPlane(GetMousePosition(), hit)) {
-                Vector3 g = worldToGrid(hit);
-                fluid.addDensitySphere(g.x, g.y, g.z, 3.0f, 8.0f);
-                if (mouseDown) {
-                    Vector3 drag = Vector3Subtract(hit, prevHit);
-                    float scale = 12.0f;
-                    fluid.addVelocitySphere(g.x, g.y, g.z, 4.0f,
-                                            drag.x * scale, drag.y * scale, drag.z * scale);
-                }
+                injectAt(hit, mouseDown, prevHit);
                 prevHit = hit;
                 mouseDown = true;
             } else {
                 mouseDown = false;
+            }
+            if (testDrag && frame >= 300 && frame <= 600) {
+                float a = (frame - 300) * 6.2831853f / 120.0f;
+                float ap = (frame - 301) * 6.2831853f / 120.0f;
+                Vector3 p1{0.5f + 0.25f * std::cos(a), 0.5f, 0.5f + 0.25f * std::sin(a)};
+                Vector3 p0{0.5f + 0.25f * std::cos(ap), 0.5f, 0.5f + 0.25f * std::sin(ap)};
+                injectAt(p1, frame > 300, p0);
             }
 
             auto t0 = std::chrono::high_resolution_clock::now();
@@ -642,17 +1059,46 @@ int main(int argc, char** argv) {
             stepMsAccum += ms;
             stepCount++;
             stepMs = (float)(stepMsAccum / stepCount);
+            if (soakFrames && frame % 100 == 0) {
+                double dsum = 0, dmx = 0, vmx = 0, ke = 0; long nan = 0, clampN = 0, cnt = (long)N * N * N;
+                for (long i = 0; i < cnt; i++) {
+                    float d = fluid.density[i], a = fluid.Vx[i], b = fluid.Vy[i], c = fluid.Vz[i];
+                    if (!std::isfinite(d) || !std::isfinite(a) || !std::isfinite(b) || !std::isfinite(c)) { nan++; continue; }
+                    dsum += d; dmx = std::max(dmx, (double)d);
+                    double vm = std::max(std::fabs(a), std::max(std::fabs(b), std::fabs(c)));
+                    vmx = std::max(vmx, vm); ke += a * a + b * b + c * c;
+                    if (vm >= fluid.maxVel * 0.999f) clampN++;
+                }
+                double pmn = 1e30, pmx = -1e30;
+                for (float pv : fluid.pressB) { pmn = std::min(pmn, (double)pv); pmx = std::max(pmx, (double)pv); }
+                printf("f=%5d dsum=%.4g dmax=%.4g vmax=%.4f ke=%.4g clamped=%ld nan=%ld cg=%d res=%.2e p=[%.3g,%.3g] ms=%.2f frm=%.2f\n",
+                       frame, dsum, dmx, vmx, ke, clampN, nan, fluid.lastCgIters, fluid.lastCgRelRes, pmn, pmx, ms,
+                       GetFrameTime() * 1000.0f);
+                fflush(stdout);
+            }
+            if (frame > 60 && frame <= 180) {
+                metMs += ms;
+                metCg += fluid.lastCgIters;
+                metRes += fluid.lastCgRelRes;
+                metBef += fluid.divRmsBefore;
+                metAft += fluid.divRmsAfter;
+                metFrm += GetFrameTime() * 1000.0;
+                metCount++;
+            }
         }
 
         float expo = fluid.exposure;
+        #pragma omp parallel for
         for (int z = 0; z < N; z++) {
             for (int y = 0; y < N; y++) {
                 int ty = z / tilesX, tx = z - ty * tilesX;
-                unsigned char* row = atlasBuf.data() + (ty * N + y) * atlasW + tx * N;
+                unsigned char* row = atlasBuf.data() + ((ty * N + y) * atlasW + tx * N) * 2;
                 const float* src = fluid.density.data() + z * N * N + y * N;
+                const float* srch = fluid.heat.data() + z * N * N + y * N;
                 for (int x = 0; x < N; x++) {
                     float v = 1.0f - std::exp(-src[x] * expo);
-                    row[x] = (unsigned char)(std::min(v, 1.0f) * 255.0f);
+                    row[x * 2] = (unsigned char)(std::min(v, 1.0f) * 255.0f);
+                    row[x * 2 + 1] = (unsigned char)(std::min(std::max(srch[x], 0.0f), 1.0f) * 255.0f);
                 }
             }
         }
@@ -661,8 +1107,16 @@ int main(int argc, char** argv) {
         int midZ = N / 2;
         for (int y = 0; y < N; y++)
             for (int x = 0; x < N; x++) {
-                float v = 1.0f - std::exp(-fluid.density[IX(x, N - 1 - y, midZ, N)] * expo);
-                sliceBuf[y * N + x] = sliceColor(v, colorMode);
+                int id = IX(x, N - 1 - y, midZ, N);
+                float v = 1.0f - std::exp(-fluid.density[id] * expo);
+                Color c = sliceColor(v, colorMode);
+                if (colorMode == 1 || colorMode == 3) {
+                    float h = std::min(std::max(fluid.heat[id], 0.0f), 1.0f);
+                    c.r = (unsigned char)std::min(255.0f, c.r + h * 255.0f);
+                    c.g = (unsigned char)std::min(255.0f, c.g + h * 110.0f);
+                    c.b = (unsigned char)std::min(255.0f, c.b + h * 30.0f);
+                }
+                sliceBuf[y * N + x] = c;
             }
         UpdateTexture(sliceTex, sliceBuf.data());
 
@@ -681,15 +1135,44 @@ int main(int argc, char** argv) {
                 SetShaderValue(volShader, locTilesY, &tilesY, SHADER_UNIFORM_INT);
                 SetShaderValue(volShader, locGridN, &N, SHADER_UNIFORM_INT);
                 SetShaderValue(volShader, locColorMode, &colorMode, SHADER_UNIFORM_INT);
-                float steps = 96.0f;
+                float steps = 64.0f;
                 SetShaderValue(volShader, locMarch, &steps, SHADER_UNIFORM_FLOAT);
                 SetShaderValueTexture(volShader, locAtlas, atlasTex);
+                Vector3 lightDir{std::cos(lightElev) * std::cos(lightAzim),
+                                 std::sin(lightElev),
+                                 std::cos(lightElev) * std::sin(lightAzim)};
+                Vector3 lightColor{1.0f, 0.92f, 0.8f};
+                float lightIntensity = 1.0f;
+                float ambient = 0.35f;
+                int lightingInt = lightingOn ? 1 : 0;
+                int shadowSteps = 5;
+                float shadowSigma = 60.0f;
+                float emission = 3.5f;
+                float toneExposure = 1.5f;
+                SetShaderValue(volShader, locToneExposure, &toneExposure, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(volShader, locLightDir, &lightDir, SHADER_UNIFORM_VEC3);
+                SetShaderValue(volShader, locLightColor, &lightColor, SHADER_UNIFORM_VEC3);
+                SetShaderValue(volShader, locLightIntensity, &lightIntensity, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(volShader, locAmbient, &ambient, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(volShader, locLighting, &lightingInt, SHADER_UNIFORM_INT);
+                SetShaderValue(volShader, locShadowSteps, &shadowSteps, SHADER_UNIFORM_INT);
+                SetShaderValue(volShader, locShadowSigma, &shadowSigma, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(volShader, locEmission, &emission, SHADER_UNIFORM_FLOAT);
+                SetShaderValue(volShader, locFrame, &frame, SHADER_UNIFORM_INT);
                 rlEnableBackfaceCulling();
                 rlSetCullFace(RL_CULL_FACE_FRONT);
                 rlDisableDepthMask();
+                BeginBlendMode(BLEND_ALPHA_PREMULTIPLY);
                 DrawModel(cubeModel, boxCenter, 1.0f, WHITE);
+                EndBlendMode();
                 rlEnableDepthMask();
                 rlSetCullFace(RL_CULL_FACE_BACK);
+                Vector3 ld{std::cos(lightElev) * std::cos(lightAzim),
+                           std::sin(lightElev),
+                           std::cos(lightElev) * std::sin(lightAzim)};
+                Vector3 tip = {boxCenter.x + ld.x * 1.2f, boxCenter.y + ld.y * 1.2f, boxCenter.z + ld.z * 1.2f};
+                DrawLine3D(boxCenter, tip, YELLOW);
+                DrawSphere(tip, 0.03f, YELLOW);
             }
             EndMode3D();
         } else {
@@ -713,34 +1196,74 @@ int main(int argc, char** argv) {
         }
 
         DrawFPS(10, 10);
-        DrawText(TextFormat("N=%d  step=%.2f ms  buoy=%.2f  diss=%.3f  iter=%d  vort=%.1f  expo=%.2f  mode=%d%s%s",
-                            N, stepMs, fluid.buoyancy, fluid.dissipation, fluid.iter, fluid.vorticity,
-                            fluid.exposure, colorMode,
+        static const char* modeNames[4] = {"smoke", "fire", "plasma", "classic"};
+        DrawText(TextFormat("N=%d  step=%.2f ms  buoy=%.2f  diss=%.3f  vort=%.1f  expo=%.2f  mode=%s%s%s",
+                            N, stepMs, fluid.buoyancy, fluid.dissipation, fluid.vorticity,
+                            fluid.exposure, modeNames[colorMode],
                             paused ? "  [PAUSED]" : "", emitter ? "  [EMIT]" : ""),
                  10, 34, 16, RAYWHITE);
+        const char* adv = fluid.advMode == 0 ? "SL" : (fluid.advMode == 1 ? "MAC(d)" : "MAC(d+v)");
+        char pstr[64];
+        if (fluid.useCG) snprintf(pstr, sizeof(pstr), "CG(%d it, res %.1e)", fluid.lastCgIters, fluid.lastCgRelRes);
+        else snprintf(pstr, sizeof(pstr), "GS(%d)", fluid.iter);
+        DrawText(TextFormat("adv=%s  p=%s  light=%s", adv, pstr, lightingOn ? "on" : "off"),
+                 10, 52, 16, RAYWHITE);
         if (showHelp) {
-            int y = 56;
+            int y = 74;
             const char* lines[] = {
                 "LMB drag: inject smoke + velocity",
                 "RMB drag: orbit   Wheel: zoom",
                 "Space: emitter  P: pause  R: reset",
                 "C: color mode  V: slice/volume view",
-                "1/2: buoyancy  3/4: dissipation  [/]: solver iters",
+                "1/2: buoyancy  3/4: dissipation  [/]: iters",
                 "5/6: vorticity  7/8: exposure",
+                "M: advect mode  G: CG/GS  L: lighting",
+                "Arrows: light direction",
                 "F1: toggle help"
             };
             for (auto l : lines) { DrawText(l, 10, y, 14, Color{200, 205, 215, 255}); y += 17; }
         }
         EndDrawing();
 
+        auto printMetrics = [&]() {
+            double inv = metCount > 0 ? 1.0 / metCount : 0.0;
+            double mb = metBef * inv, ma = metAft * inv;
+            printf("avg step=%.3f ms  avg frame=%.3f ms  cgIters=%.1f  cgRelRes=%.2e  divRms before=%.4e after=%.4e  ratio=%.4f\n",
+                   metMs * inv, metFrm * inv, metCg * inv, metRes * inv, mb, ma, mb > 0 ? ma / mb : 0.0);
+        };
+        if (soakFrames && frame >= soakFrames) { TakeScreenshot(sliceView ? "soak_slice.png" : "soak.png"); break; }
         if (shotVolume && frame >= 180) {
             TakeScreenshot("shot.png");
-            printf("avg step time: %.3f ms over %d steps\n", stepMsAccum / stepCount, stepCount);
+            printMetrics();
+            if (lumCheck) {
+                float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+                for (int cx = 0; cx < 2; cx++)
+                    for (int cy = 0; cy < 2; cy++)
+                        for (int cz = 0; cz < 2; cz++) {
+                            Vector2 s = GetWorldToScreen({(float)cx, (float)cy, (float)cz}, cam);
+                            x0 = std::min(x0, s.x); x1 = std::max(x1, s.x);
+                            y0 = std::min(y0, s.y); y1 = std::max(y1, s.y);
+                        }
+                int ix0 = std::max(0, (int)x0), ix1 = std::min(GetScreenWidth() - 1, (int)std::ceil(x1));
+                int iy0 = std::max(200, (int)y0), iy1 = std::min(GetScreenHeight() - 1, (int)std::ceil(y1));
+                Image img = LoadImage("shot.png");
+                Color* px = LoadImageColors(img);
+                double sum = 0; long n = 0;
+                for (int y = iy0; y <= iy1; y++)
+                    for (int x = ix0; x <= ix1; x++) {
+                        Color c = px[y * img.width + x];
+                        sum += 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+                        n++;
+                    }
+                printf("lum=%.2f\n", n ? sum / n : 0.0);
+                UnloadImageColors(px);
+                UnloadImage(img);
+            }
             break;
         }
         if (shotSlice && frame >= 180) {
             TakeScreenshot("shot_slice.png");
-            printf("avg step time: %.3f ms over %d steps\n", stepMsAccum / stepCount, stepCount);
+            printMetrics();
             break;
         }
     }
